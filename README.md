@@ -51,6 +51,8 @@ $ python3 fierce.py -h
 
 # Using
 
+## Standalone usage
+
 Let's start with something basic:
 
 ```
@@ -111,5 +113,33 @@ Check out `--help` for further information:
 $ fierce --help
 ```
 
-# TODO
 
+## Python 3 module usage
+
+The only required parameter is {{domain}} and by default the function call
+returns a python dictionary of results:
+
+
+`print=True` will print json output
+
+`pretty_print=True` prints json with indentation
+
+
+```python
+# Until this is properly packaged as a library, this is a relative path import
+from fierce.fierce import fierce
+
+
+# domain is the only required option
+result = fierce(domain='localhost',
+                concurrency=15,
+                pretty_print=True,
+                connect=True)
+
+# Fierce returns a python dictionary of results
+print(result)
+```
+
+# TODO
+- Tests
+- Package and make importable as a library
