@@ -211,10 +211,12 @@ def fierce(**kwargs):
         domain = dns.name.from_text(kwargs['domain'])
     else:
         return
+
     if not domain.is_absolute():
         domain = domain.concatenate(dns.name.root)
 
     # DNS times out sometimes
+    domain_name_servers = []
     for attempt in range(0, 5):
         ns = query(resolver, domain, record_type='NS')
         if ns is not None:
@@ -224,14 +226,17 @@ def fierce(**kwargs):
 
 
     soa = query(resolver, domain, record_type='SOA')
-    soa_mname = soa[0].mname
-    master = query(resolver, soa_mname, record_type='A')
-    master_address = master[0].address
-
     zone = {}
-    zone_dump = zone_transfer(master_address, domain)
-    if zone_dump is not None:
-        zone = {(k.to_text() + '.' + domain.to_text()): v.to_text(k) for k, v in zone_dump.items()}
+    soa_mname = ''
+    if soa:
+        soa_mname = soa[0].mname
+        master = query(resolver, soa_mname, record_type='A')
+        if master:
+            master_address = master[0].address
+
+            zone_dump = zone_transfer(master_address, domain)
+            if zone_dump is not None:
+                zone = {(k.to_text() + '.' + domain.to_text()): v.to_text(k) for k, v in zone_dump.items()}
 
     random_subdomain = str(random.randint(1e10, 1e11))
     random_domain = concatenate_subdomains(domain, [random_subdomain])
@@ -332,11 +337,12 @@ def fierce(**kwargs):
             results = {'target': domain.to_text(),
                        'hosts': get_hosts(hosts),
                        'nameservers': domain_name_servers,
-                       'soa_mname': soa_mname.to_text(),
                        'zone': zone if len(zone) > 0 else False,
                        'wildcard': bool(wildcard),
                        'range': reversed_ips
                        }
+
+            results['soa_mname'] = soa_mname.to_text() if soa_mname else ''
 
             if kwargs.get('pretty_print'):
                 print(json.dumps(results, indent=4))
