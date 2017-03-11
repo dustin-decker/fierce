@@ -5,11 +5,11 @@ import functools
 import http.client
 import ipaddress
 import os
-import pprint
 import random
 import socket
 import time
 from multiprocessing import Process, Queue
+import json
 
 import dns.name
 import dns.query
@@ -63,19 +63,31 @@ def find_subdomain_list_file(filename):
 
 
 def head_request(url):
-    conn = http.client.HTTPConnection(url)
+    conn = http.client.HTTPConnection(url, timeout=3)
 
     try:
         conn.request("HEAD", "/")
     except socket.gaierror:
         return []
+    except (ConnectionRefusedError, socket.error):
+        return []
     else:
-        resp = conn.getresponse()
+        try:
+            resp = conn.getresponse()
+        except socket.timeout:
+            return []
     finally:
         conn.close()
 
-    return resp.getheaders()
+    resp_headers = resp.getheaders()
+    if resp_headers:
+        headers = {}
+        for header in resp_headers:
+            headers[header[0]] = header[1]
 
+        return headers
+    else:
+        return None
 
 def concatenate_subdomains(domain, subdomains):
     result = dns.name.Name(tuple(subdomains) + domain.labels)
@@ -100,7 +112,7 @@ def query(resolver, domain, record_type='A'):
                 rdata.address
                 for additionals in resp.response.additional
                 for rdata in additionals.items
-            ]
+                ]
             resolver.nameservers = ns
             return query(resolver, domain, record_type)
 
@@ -118,11 +130,13 @@ def zone_transfer(address, domain):
         return dns.zone.from_xfr(dns.query.xfr(address, domain))
     except (ConnectionResetError, dns.exception.FormError):
         return None
+    except (ConnectionRefusedError, dns.exception.FormError):
+        return None
 
 
 def get_class_c_network(ip):
     ip = int(ip)
-    floored = ipaddress.ip_address(ip - (ip % (2**8)))
+    floored = ipaddress.ip_address(ip - (ip % (2 ** 8)))
     class_c = ipaddress.IPv4Network('{}/24'.format(floored))
 
     return class_c
@@ -157,16 +171,24 @@ def find_nearby(resolver, ips, filter_func=None):
         reversed_ips = {k: v for k, v in reversed_ips.items() if v and filter_func(v[0].to_text())}
 
     if not reversed_ips:
-        return
+        return None
 
-    print("Nearby:")
-    pprint.pprint({k: v[0].to_text() for k, v in reversed_ips.items() if v})
+    return {k: v[0].to_text() for k, v in reversed_ips.items() if v}
 
 
 def fierce(**kwargs):
+    """
+    fierce function is directly callable and returns a results dictionary
+    :param concurrency:
+    :param domain:
+    :param print:
+    :param connect:
+    :return: python dictionary of results
+    """
+
     resolver = dns.resolver.Resolver()
 
-    nameservers = None
+    nameservers = []
     if kwargs.get('dns_servers'):
         nameservers = kwargs['dns_servers']
     elif kwargs.get('dns_file'):
@@ -175,76 +197,98 @@ def fierce(**kwargs):
     if nameservers:
         resolver.nameservers = nameservers
 
+    reversed_ips = False
     if kwargs.get("range"):
         internal_range = ipaddress.IPv4Network(kwargs.get("range"))
-        find_nearby(resolver, list(internal_range))
+        reversed_ips = find_nearby(resolver, list(internal_range))
 
-    if not kwargs.get("domain"):
-        return
-    
     if not kwargs.get("concurrency"):
         numWorkers = 1
     else:
         numWorkers = kwargs.get("concurrency")
 
-    domain = dns.name.from_text(kwargs['domain'])
+    if kwargs.get("domain"):
+        domain = dns.name.from_text(kwargs['domain'])
+    else:
+        return
+
     if not domain.is_absolute():
         domain = domain.concatenate(dns.name.root)
 
-    ns = query(resolver, domain, record_type='NS')
-    domain_name_servers = [n.to_text() for n in ns]
-    print("NS: {}".format(" ".join(domain_name_servers)))
+    # DNS times out sometimes
+    domain_name_servers = []
+    for attempt in range(0, 5):
+        ns = query(resolver, domain, record_type='NS')
+        if ns is not None:
+            domain_name_servers = [n.to_text() for n in ns]
+            break
+        time.sleep(3)
+
 
     soa = query(resolver, domain, record_type='SOA')
-    soa_mname = soa[0].mname
-    master = query(resolver, soa_mname, record_type='A')
-    master_address = master[0].address
-    print("SOA: {} ({})".format(soa_mname, master_address))
+    zone = {}
+    soa_mname = ''
+    if soa:
+        soa_mname = soa[0].mname
+        master = query(resolver, soa_mname, record_type='A')
+        if master:
+            master_address = master[0].address
 
-    zone = zone_transfer(master_address, domain)
-    print("Zone: {}".format("success" if zone else "failure"))
-    if zone:
-        pprint.pprint({k: v.to_text(k) for k, v in zone.items()})
-        return
+            zone_dump = zone_transfer(master_address, domain)
+            if zone_dump is not None:
+                zone = {(k.to_text() + '.' + domain.to_text()): v.to_text(k) for k, v in zone_dump.items()}
 
     random_subdomain = str(random.randint(1e10, 1e11))
     random_domain = concatenate_subdomains(domain, [random_subdomain])
     wildcard = query(resolver, random_domain, record_type='A')
-    print("Wildcard: {}".format("success" if wildcard else "failure"))
 
     if kwargs.get('subdomains'):
         subdomains = kwargs["subdomains"]
     else:
-        subdomains = [sd.strip() for sd in open(kwargs["subdomain_file"]).readlines()]
+        if kwargs.get("subdomain_file"):
+            subdomain_file = kwargs.get("subdomain_file")
+        else:
+            subdomain_file = find_subdomain_list_file('default.txt')
+
+        subdomains = [sd.strip() for sd in open(subdomain_file).readlines()]
+
 
     visited = set()
 
-    def subdomainWorker(visited):  
+    hosts = Queue()
+
+    def subdomainWorker(visited):
         while True:
             subdomain = subdomainQueue.get()
             if type(subdomain) is int:
                 return
             url = concatenate_subdomains(domain, [subdomain])
-            record = query(resolver, url, record_type='A')
+            try:
+                record = query(resolver, url, record_type='A')
+            except dns.exception.Timeout:
+                return
 
             if record is None:
                 continue
 
-            ip = ipaddress.IPv4Address(record[0].address)
-            print("Found: {} ({})".format(url, ip))
+            try:
+                ip = ipaddress.IPv4Address(record[0].address)
+            except TypeError:
+                return
 
+            headers = False
             if kwargs.get('connect') and not ip.is_private:
                 headers = head_request(str(ip))
-                if headers:
-                    print("HTTP connected:")
-                    pprint.pprint(headers)
+
+            if kwargs.get("traverse"):
+                traverse = kwargs.get("traverse")
+            else:
+                traverse = 5
 
             if kwargs.get("wide"):
                 ips = wide_expander(ip)
-            elif kwargs.get("traverse"):
-                ips = traverse_expander(ip, kwargs["traverse"])
             else:
-                continue
+                ips = traverse_expander(ip, traverse)
 
             filter_func = None
             if kwargs.get("search"):
@@ -253,11 +297,18 @@ def fierce(**kwargs):
             ips = set(ips) - set(visited)
             visited |= ips
 
-            find_nearby(resolver, ips, filter_func=filter_func)
+            hosts.put({
+                str(url): {
+                    'ip': str(ip),
+                    'headers': headers,
+                    'nearby': find_nearby(resolver, ips, filter_func=filter_func)
+                }
+            })
 
             if kwargs.get("delay"):
                 time.sleep(kwargs["delay"])
-
+            else:
+                time.sleep(0)
 
     workers = []
     subdomainQueue = Queue()
@@ -270,45 +321,75 @@ def fierce(**kwargs):
     while True:
         if subdomainQueue.empty():
             for i in range(numWorkers):
+                # workers terminate when they encounter an int
                 subdomainQueue.put(50)
             for worker in workers:
+                # blocks until process terminates
                 worker.join()
-                sys.exit()
+
+            def get_hosts(q):
+                d = {}
+                while q.qsize() > 0:
+                    for fqdn, nearby in q.get().items():
+                        d[fqdn] = nearby
+                return d
+
+            results = {'target': domain.to_text(),
+                       'hosts': get_hosts(hosts),
+                       'nameservers': domain_name_servers,
+                       'zone': zone if len(zone) > 0 else False,
+                       'wildcard': bool(wildcard),
+                       'range': reversed_ips
+                       }
+
+            results['soa_mname'] = soa_mname.to_text() if soa_mname else ''
+
+            if kwargs.get('pretty_print'):
+                print(json.dumps(results, indent=4))
+            if kwargs.get('print'):
+                print(json.dumps(results))
+
+            return results
+
 
 def parse_args():
     p = argparse.ArgumentParser(description='''
         A DNS reconnaissance tool for locating non-contiguous IP space.
         ''', formatter_class=argparse.RawTextHelpFormatter)
 
+    p.add_argument('--print', action='store_true',
+                   help='print the results')
+    p.add_argument('--pretty-print', action='store_true', default=True,
+                   help='print the results')
     p.add_argument('--domain', action='store',
-        help='domain name to test')
+                   help='domain name to test')
     p.add_argument('--concurrency', action='store', type=int,
-        help='number of cuncurrent processes')
+                   help='number of cuncurrent processes')
     p.add_argument('--connect', action='store_true',
-        help='attempt HTTP connection to non-RFC 1918 hosts')
+                   help='attempt HTTP connection to non-RFC 1918 hosts')
     p.add_argument('--wide', action='store_true',
-        help='scan entire class c of discovered records')
+                   help='scan entire class c of discovered records')
     p.add_argument('--traverse', action='store', type=int, default=5,
-        help='scan IPs near discovered records, this won\'t enter adjacent class c\'s')
+                   help='scan IPs near discovered records, this won\'t enter adjacent class c\'s')
     p.add_argument('--search', action='store', nargs='+',
-        help='filter on these domains when expanding lookup')
+                   help='filter on these domains when expanding lookup')
     p.add_argument('--range', action='store',
-        help='scan an internal IP range, use cidr notation')
+                   help='scan an internal IP range, use cidr notation')
     p.add_argument('--delay', action='store', type=float, default=None,
-        help='time to wait between lookups')
+                   help='time to wait between lookups')
 
     subdomain_group = p.add_mutually_exclusive_group()
     subdomain_group.add_argument('--subdomains', action='store', nargs='+',
-        help='use these subdomains')
-    subdomain_group.add_argument('--subdomain-file', action='store',
-        default="default.txt",
-        help='use subdomains specified in this file (one per line)')
+                                 help='use these subdomains')
+    subdomain_group.add_argument('--subdomain_file', action='store',
+                                 default="default.txt",
+                                 help='use subdomains specified in this file (one per line)')
 
     dns_group = p.add_mutually_exclusive_group()
     dns_group.add_argument('--dns-servers', action='store', nargs='+',
-        help='use these dns servers for reverse lookups')
+                           help='use these dns servers for reverse lookups')
     dns_group.add_argument('--dns-file', action='store',
-        help='use dns servers specified in this file for reverse lookups (one per line)')
+                           help='use dns servers specified in this file for reverse lookups (one per line)')
 
     args = p.parse_args()
 
@@ -324,6 +405,7 @@ def main():
     args = parse_args()
 
     fierce(**vars(args))
+
 
 if __name__ == "__main__":
     main()
